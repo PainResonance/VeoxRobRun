@@ -68,6 +68,9 @@
     <ClCompile Include="SDK\SkinChanger.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="SDK\FovChanger.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Esp\WorldEsp.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -75,6 +78,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Esp\WebRadar.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Esp\IconSprites.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Misc\Colour.cpp">
@@ -148,6 +154,9 @@
     <ClInclude Include="Esp\WorldEsp.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Esp\IconSprites.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="Esp\EspDraw.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -212,6 +221,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="SDK\SkinChanger.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SDK\FovChanger.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Security\XorStr.h">

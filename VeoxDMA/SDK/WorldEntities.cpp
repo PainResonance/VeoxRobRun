@@ -1,19 +1,38 @@
 #include "pch.h"
 #include "WorldEntities.h"
+#include "../Config/LootFilterData.h"
+#include "../Config/ConfigInstance.h"
+#include "Diag.h"
 #include "RobRunSDK.h"
 #include "RobRunMemory.h"
 #include "Il2Cpp.h"
 #include "Memory.h"
 #include "DebugLog.h"
 #include <cmath>
+#include <charconv>
+#include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
+
+
+// Trunk/table inventory walks stay off the hot path: the slot layout is still
+// unpinned and each slot costs a DMA read on every world refresh.
+inline constexpr bool kReadInventories = false;
 
 namespace RobRunWorld {
 
 void Init(std::uintptr_t gameAssemblyBase)
 {
     Il2Cpp::Init(gameAssemblyBase);
+}
+
+bool IsPaintingId(std::string_view id)
+{
+    return id.starts_with("original_picture_") || id.starts_with("trash_picture_") ||
+        id.starts_with("picture_tube_") || id.starts_with("picture_fake_");
 }
 
 const char* KindName(Kind kind)
@@ -159,6 +178,170 @@ std::string ReadIdentifiedId(std::uintptr_t obj)
     return RobRunMemory::WideToUtf8(wide);
 }
 
+// A plain identifier: printable, not a bare number. Numeric "labels" mean the
+// wrong field was read, so they are rejected rather than shown on screen.
+bool LooksLikeId(const std::string& s)
+{
+    if (s.empty() || s.size() > 64) return false;
+    bool hasAlpha = false;
+    for (unsigned char c : s) {
+        if (c < 0x20 || c > 0x7E) return false;
+        if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') hasAlpha = true;
+    }
+    return hasAlpha;
+}
+
+// Func<T> held at obj+offset. Il2CppDelegate layout: +0x10 method_ptr (code),
+// +0x18 invoke_impl, +0x20 target (the closure that holds the captured value).
+// Reading +0x10 yields code bytes, which is why the old version returned the
+// same number for every item.
+std::uintptr_t ReadFuncTarget(std::uintptr_t obj, std::uintptr_t funcOffset)
+{
+    if (obj <= 0x10000) return 0;
+    const std::uintptr_t fn = RobRunMemory::ReadPtr(obj + funcOffset);
+    if (fn <= 0x10000) return 0;
+    const std::uintptr_t target = RobRunMemory::ReadPtr(fn + 0x20);
+    if (target <= 0x10000) return 0;
+    return RobRunMemory::ReadPtr(target + 0x10);
+}
+
+// LootObjectItemDescription -> InventoryItemDescription. The tiered item id
+// ("starh_m2") and the rarity live there; the loot-object id ("star_h_m_2")
+// only names the generic pickup. The closure keeps its captured value at 0x10
+// on most delegates and 0x18 on others, so both are tried and the first that
+// reads back a plausible identifier wins.
+std::uintptr_t ReadFuncIdentifiedTarget(std::uintptr_t obj, std::uintptr_t funcOffset)
+{
+    if (obj <= 0x10000) return 0;
+    const std::uintptr_t fn = RobRunMemory::ReadPtr(obj + funcOffset);
+    if (fn <= 0x10000) return 0;
+    const std::uintptr_t target = RobRunMemory::ReadPtr(fn + 0x20);
+    if (target <= 0x10000) return 0;
+
+    std::uintptr_t first = 0;
+    for (const std::uintptr_t valueOffset : { (std::uintptr_t)0x10, (std::uintptr_t)0x18 }) {
+        const std::uintptr_t value = RobRunMemory::ReadPtr(target + valueOffset);
+        if (value <= 0x10000) continue;
+        if (!first) first = value;
+        if (LooksLikeId(ReadIdentifiedId(value))) return value;
+    }
+    return first;
+}
+
+
+// Is this id one the loot catalog knows as an item? Loot-object ids and item
+// ids both look like identifiers, so the catalog is what tells them apart.
+bool IsKnownItemId(const std::string& id)
+{
+    static std::unordered_set<std::string> s_ids;
+    if (s_ids.empty()) {
+        for (const auto& def : LootFilter::kItemCatalog) {
+            if (!def.labelMatch[0]) continue;
+            std::string key(def.labelMatch);
+            std::transform(key.begin(), key.end(), key.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            s_ids.insert(std::move(key));
+        }
+    }
+    if (id.empty()) return false;
+    std::string key(id);
+    std::transform(key.begin(), key.end(), key.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    return s_ids.count(key) > 0;
+}
+
+// Func<int>: the delegate closes over the value, so the number sits in the
+// target object. Many of these are constant returns, which is what makes a
+// price readable at all - the game never stores prices as plain fields.
+bool ReadFuncInt(std::uintptr_t obj, std::uintptr_t funcOffset, int& out)
+{
+    if (obj <= 0x10000) return false;
+    const std::uintptr_t fn = RobRunMemory::ReadPtr(obj + funcOffset);
+    if (fn <= 0x10000) return false;
+    const std::uintptr_t target = RobRunMemory::ReadPtr(fn + 0x20);   // delegate target, not method_ptr
+    if (target <= 0x10000) return false;
+    for (const std::uintptr_t off : { (std::uintptr_t)0x10, (std::uintptr_t)0x18 }) {
+        const int value = RobRunMemory::ReadInt32(target + off);
+        if (value > 0 && value < 100000000) { out = value; return true; }
+    }
+    return false;
+}
+
+// InventoryItemDescription carries BasePriceFunc (0x78) and SellPriceFunc (0x88).
+bool ReadItemPrices(std::uintptr_t itemDesc, int& basePrice, int& sellPrice)
+{
+    basePrice = 0;
+    sellPrice = 0;
+    if (itemDesc <= 0x10000) return false;
+    const bool haveBase = ReadFuncInt(itemDesc, rr::InventoryItemDescriptionModel::BasePriceFunc, basePrice);
+    const bool haveSell = ReadFuncInt(itemDesc, rr::InventoryItemDescriptionModel::SellPriceFunc, sellPrice);
+    return haveBase || haveSell;
+}
+
+std::uintptr_t ResolveInventoryItemDescription(std::uintptr_t lootObjectItem)
+{
+    return ReadFuncTarget(lootObjectItem,
+        rr::LootObjectItemDescriptionModel::ItemDescriptionFunc);
+}
+
+// Deeper variant: a LootObjectItemDescription reaches its InventoryItemDescription
+// through ItemDescriptionFunc, but on some wrappers the description sits one
+// level down instead. Try the func, then each slot, validating against a real
+// identifier so a wrong hop can never be mistaken for a hit.
+std::uintptr_t ResolveItemDescriptionDeep(std::uintptr_t lootObjectItem)
+{
+    if (lootObjectItem <= 0x10000) return 0;
+
+    const std::uintptr_t direct = ReadFuncIdentifiedTarget(
+        lootObjectItem, rr::LootObjectItemDescriptionModel::ItemDescriptionFunc);
+    if (direct > 0x10000 && LooksLikeId(ReadIdentifiedId(direct)))
+        return direct;
+
+    for (const std::uintptr_t off : { (std::uintptr_t)0x10, (std::uintptr_t)0x18,
+                                      (std::uintptr_t)0x20, (std::uintptr_t)0x28 }) {
+        const std::uintptr_t value = RobRunMemory::ReadPtr(lootObjectItem + off);
+        if (value <= 0x10000) continue;
+        if (LooksLikeId(ReadIdentifiedId(value))) return value;
+
+        const std::uintptr_t nested = ReadFuncIdentifiedTarget(value,
+            rr::LootObjectItemDescriptionModel::ItemDescriptionFunc);
+        if (nested > 0x10000 && LooksLikeId(ReadIdentifiedId(nested))) return nested;
+    }
+    return 0;
+}
+
+// One-shot pointer walk. Generic wrappers (IPrimitiveData<T>, Func<T>) report
+// 0x0 field offsets in the dump, so the only honest way to learn a hop is to
+// print the words and the strings they point at, once, from a live session.
+std::string ShortString(std::uintptr_t obj)
+{
+    if (obj <= 0x10000) return {};
+    std::wstring wide;
+    if (!RobRunMemory::ReadString(obj, wide, 32)) return {};
+    std::string s = RobRunMemory::WideToUtf8(wide);
+    for (char& c : s)
+        if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) c = '?';
+    return s;
+}
+
+void ProbeWords(const char* tag, std::uintptr_t base, int count)
+{
+    if (!kProbes) return;   // instrumentation only; silent unless asked for
+    if (base <= 0x10000) { VeoxDiag("%s: base=null", tag); return; }
+    std::string line;
+    for (int i = 0; i < count; ++i) {
+        const std::uintptr_t v = RobRunMemory::ReadPtr(base + i * 8);
+        const std::string s = ShortString(v);
+        char buf[128];
+        if (!s.empty())
+            snprintf(buf, sizeof(buf), " +%02X=%llX('%s')", i * 8, (unsigned long long)v, s.c_str());
+        else
+            snprintf(buf, sizeof(buf), " +%02X=%llX", i * 8, (unsigned long long)v);
+        line += buf;
+    }
+    VeoxDiag("%s:%s", tag, line.c_str());
+}
+
 // Inline Vector3 stored on the model's description object.
 bool ReadDescriptionPosition(std::uintptr_t model, std::uintptr_t descriptionOffset,
     std::uintptr_t positionOffset, Vector3& out)
@@ -250,6 +433,128 @@ bool WorldLooksValid(std::uintptr_t world)
         CollectionLooksValid(world, rr::WorldEntitiesModel::SettlementCash);
 }
 
+
+// Loot objects stay in the world dictionary after being picked up; the model
+// flips _isTaken (ILootObjectModel, IPrimitiveData<bool> at 0x10) instead of
+// disappearing. Without this check the ESP keeps drawing loot that is gone.
+// Two ids refer to the same thing once separators and case are folded
+// ("alcohol_9" == "Alcohol_9" == "alcohol9").
+bool LenientEquals(const std::string& a, const std::string& b)
+{
+    auto fold = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (unsigned char c : s)
+            if (std::isalnum(c)) out.push_back((char)std::tolower(c));
+        return out;
+    };
+    return !a.empty() && !b.empty() && fold(a) == fold(b);
+}
+
+bool IsLootTaken(std::uintptr_t model)
+{
+    if (!ConfigInstance.LootFilter.FilterTakenLoot) return false;
+    if (model <= 0x10000) return false;
+    const std::uintptr_t wrapper = RobRunMemory::ReadPtr(model + 0x10);
+    if (wrapper <= 0x10000) return false;
+    // Guard the hop: a bool must come from a boolean primitive, otherwise a
+    // misplaced pointer could report every object as already looted.
+    const std::string className = Il2Cpp::ClassNameOfClass(Il2Cpp::ClassOf(wrapper));
+    if (className.find("Bool") == std::string::npos &&
+        className.find("bool") == std::string::npos)
+        return false;
+    bool taken = false;
+    if (Il2Cpp::ReadPrimitiveBool(wrapper, taken)) return taken;
+    return false;
+}
+
+
+// ---------------------------------------------------------------- inventories
+// A trunk or a grow table stores its contents as a slot grid:
+//   IInventoryModel (0x18) -> InventorySlotsModel (ReadOnlyDictionaryModel)
+//     -> _models (0x10) : Dictionary<InventorySlotDescription, IInventorySlotModel>
+// Every slot model holds a reference to an item description somewhere, but the
+// concrete slot class differs per container, so instead of hardcoding one offset
+// each slot's first pointers are checked and the first that yields a known item
+// id wins. Validation is the guard: a wrong hop cannot pass it.
+void EnumerateInventoryItems(std::uintptr_t inventory, std::size_t maxItems,
+    const std::function<void(const std::string&, std::uintptr_t)>& emit)
+{
+    if (inventory <= 0x10000) return;
+    const std::uintptr_t slots = RobRunMemory::ReadPtr(inventory + 0x18);
+    if (slots <= 0x10000) return;
+    const std::uintptr_t dictionary = RobRunMemory::ReadPtr(slots + 0x10);
+    if (dictionary <= 0x10000) return;
+
+    std::vector<RobRunMemory::RefDictEntry> entries;
+    if (!RobRunMemory::ReadDictRef(dictionary, entries, false)) return;
+
+    std::size_t emitted = 0;
+    for (const auto& entry : entries) {
+        if (entry.value <= 0x10000) continue;
+        for (std::uintptr_t off = 0x10; off <= 0x60; off += 8) {
+            const std::uintptr_t candidate = RobRunMemory::ReadPtr(entry.value + off);
+            if (candidate <= 0x10000) continue;
+            const std::string id = ReadIdentifiedId(candidate);
+            if (!IsKnownItemId(id)) continue;
+            emit(id, candidate);
+            if (++emitted >= maxItems) return;
+            break;
+        }
+    }
+}
+
+// Vehicle trunks: world + 0xC0 -> VehicleTrunkModel.Inventory (0x20).
+void AddVehicleTrunkContents(std::uintptr_t world, std::vector<Entity>& items)
+{
+    std::vector<RobRunMemory::DictEntry> trunks;
+    if (!ReadCollection(world, rr::WorldEntitiesModel::VehicleTrunks, trunks)) return;
+
+    for (const auto& trunk : trunks) {
+        if (trunk.value <= 0x10000) continue;
+        Vector3 position{};
+        const std::uintptr_t inventory = RobRunMemory::ReadPtr(trunk.value + 0x20);
+        if (inventory <= 0x10000) continue;
+
+        EnumerateInventoryItems(inventory, 24, [&](const std::string& id, std::uintptr_t) {
+            Entity entity{};
+            entity.id = trunk.key;
+            entity.kind = Kind::Loot;
+            entity.label = id;
+            entity.inVehicle = true;
+            items.push_back(std::move(entity));
+        });
+    }
+}
+
+// Plot containers / grow tables: world + 0x138 -> inventory model.
+void AddPlotContainerContents(std::uintptr_t world, std::vector<Entity>& items)
+{
+    std::vector<RobRunMemory::DictEntry> containers;
+    if (!ReadCollection(world, rr::WorldEntitiesModel::PlotContainers, containers)) return;
+
+    for (const auto& entry : containers) {
+        if (entry.value <= 0x10000) continue;
+        std::uintptr_t inventory = RobRunMemory::ReadPtr(entry.value + 0x18);
+        if (inventory <= 0x10000) inventory = entry.value;   // some models *are* the inventory
+
+        EnumerateInventoryItems(inventory, 16, [&](const std::string& id, std::uintptr_t) {
+            Entity entity{};
+            entity.id = entry.key;
+            entity.kind = Kind::Loot;
+            entity.label = id;
+            entity.inTable = true;
+            items.push_back(std::move(entity));
+        });
+    }
+}
+
+bool IsLootKind(Kind kind)
+{
+    return kind == Kind::StaticLoot || kind == Kind::RandomLoot || kind == Kind::Loot ||
+           kind == Kind::VehicleLoot || kind == Kind::DroppedBag;
+}
+
 void AddDictionary(std::uintptr_t world, std::uintptr_t dictionaryOffset, Kind kind,
     const PositionReader& readPosition, State& out, int& kindCounter)
 {
@@ -259,6 +564,7 @@ void AddDictionary(std::uintptr_t world, std::uintptr_t dictionaryOffset, Kind k
     for (const auto& entry : entries) {
         const std::uintptr_t model = entry.value;
         if (model <= 0x10000) continue;
+        if (IsLootKind(kind) && IsLootTaken(model)) continue;
 
         Vector3 position{};
         if (!readPosition(model, position) || !ValidPosition(position)) continue;
@@ -277,6 +583,156 @@ void AddDictionary(std::uintptr_t world, std::uintptr_t dictionaryOffset, Kind k
 
 // High-speed scatter reader for description-based world collections.
 // Reduces hundreds of individual DMA round trips down to two batched transactions.
+// Resolve a typed description delegate without calling it in the game.
+std::uintptr_t ResolveDescriptionDelegate(std::uintptr_t func, const char* directClosure,
+    const char* captureName)
+{
+    if (!Il2Cpp::IsClass(func, "Func`1")) return 0;
+
+    constexpr std::uintptr_t delegateTarget = 0x20;
+    const auto target = RobRunMemory::ReadPtr(func + delegateTarget);
+    const std::string targetClass = Il2Cpp::ClassNameOf(target);
+
+    if (targetClass == directClosure) {
+        Il2Cpp::Field capture{};
+        if (!Il2Cpp::FindField(Il2Cpp::ClassOf(target), captureName, capture) ||
+            capture.offset != 0x10)
+            return 0;
+        return RobRunMemory::ReadPtr(target + capture.offset);
+    }
+    if (targetClass != "<>c__DisplayClass5_0`1") return 0;
+
+    constexpr std::uintptr_t capturedEnum = 0x10;
+    constexpr std::uintptr_t capturedIndex = 0x18;
+    constexpr std::uintptr_t enumItems = 0x10;
+    const auto registry = RobRunMemory::ReadPtr(target + capturedEnum);
+    if (!Il2Cpp::IsClass(registry, "Enum`1")) return 0;
+    const auto list = RobRunMemory::ReadPtr(registry + enumItems);
+    if (!Il2Cpp::IsClass(list, "List`1")) return 0;
+
+    std::int32_t index = -1;
+    std::int32_t count = 0;
+    if (!RobRunMemory::ReadBytes(target + capturedIndex, &index, sizeof(index)) ||
+        !RobRunMemory::ReadBytes(list + rr::List::count, &count, sizeof(count)) ||
+        index < 0 || index >= count)
+        return 0;
+
+    const auto array = RobRunMemory::ReadPtr(list + rr::List::items);
+    std::uint64_t length = 0;
+    if (array <= 0x10000 ||
+        !RobRunMemory::ReadBytes(array + rr::Array::max_length, &length, sizeof(length)) ||
+        static_cast<std::uint64_t>(count) > length)
+        return 0;
+
+    return RobRunMemory::ReadPtr(array + rr::Array::vector +
+        static_cast<std::uintptr_t>(index) * rr::Array::stride);
+}
+
+std::uintptr_t ResolveLootInventory(std::uintptr_t loot)
+{
+    if (!Il2Cpp::IsClass(loot, "LootObjectItemDescription")) return 0;
+    const auto func = RobRunMemory::ReadPtr(
+        loot + rr::LootObjectItemDescriptionModel::ItemDescriptionFunc);
+    const auto item = ResolveDescriptionDelegate(func, "<>c__DisplayClass3_0", "itemDescription");
+    return Il2Cpp::IsClassOrDerived(item, "InventoryItemDescription") ? item : 0;
+}
+
+void ReadInventoryRarity(std::uintptr_t inventory, Entity& entity)
+{
+    int rarity = -1;
+    if (inventory && RobRunMemory::ReadBytes(inventory + rr::InventoryItemDescriptionModel::Rarity,
+            &rarity, sizeof(rarity)) && rarity >= 0 && rarity <= 6)
+        entity.rarity = rarity;
+}
+
+// Accept only a complete constant-return method or the verified getter for
+// the same inventory object's captured base price. Never execute the delegate.
+std::optional<int> ReadPaintingPrice(std::uintptr_t inventory, std::uintptr_t field)
+{
+    if (!inventory) return std::nullopt;
+    const auto fn = RobRunMemory::ReadPtr(inventory + field);
+    if (!Il2Cpp::IsClass(fn, "Func`1")) return std::nullopt;
+    // The constructor stores the item's base price in an owned capture.
+    // Some getters contain extra instructions beyond the simple return forms.
+    if (field == rr::InventoryItemDescriptionModel::BasePriceFunc) {
+        const auto target = RobRunMemory::ReadPtr(fn + 0x20);
+        const auto klass = Il2Cpp::ClassOf(target);
+        Il2Cpp::Field basePrice{};
+        Il2Cpp::Field owner{};
+        int captured = -1;
+        if (Il2Cpp::FindField(klass, "basePrice", basePrice) && basePrice.offset == 0x18 &&
+            Il2Cpp::FindField(klass, "<>4__this", owner) && owner.offset == 0x10 &&
+            RobRunMemory::ReadPtr(target + owner.offset) == inventory &&
+            RobRunMemory::ReadBytes(target + basePrice.offset, &captured, sizeof(captured)) &&
+            captured >= 0 && captured < 100000000)
+            return captured;
+    }
+    const auto method = RobRunMemory::ReadPtr(fn + 0x10);
+    unsigned char code[6]{};
+    if (!RobRunMemory::ReadBytes(method, code, sizeof(code))) return std::nullopt;
+
+    int price = -1;
+    if (code[0] == 0xB8 && code[5] == 0xC3) {
+        std::memcpy(&price, code + 1, sizeof(price)); // mov eax, constant; ret
+    } else if (code[0] == 0x33 && code[1] == 0xC0 && code[2] == 0xC3) {
+        price = 0; // xor eax, eax; ret
+    } else if (code[0] == 0x8B && code[1] == 0x41 && code[2] == 0x18 && code[3] == 0xC3) {
+        const auto target = RobRunMemory::ReadPtr(fn + 0x20);
+        if (!Il2Cpp::IsClass(target, "<>c__DisplayClass327_0") ||
+            RobRunMemory::ReadPtr(target + 0x10) != inventory ||
+            !RobRunMemory::ReadBytes(target + 0x18, &price, sizeof(price)))
+            return std::nullopt;
+    }
+    if (price < 0 || price >= 100000000) return std::nullopt;
+    return price;
+}
+
+void ReadPaintingPrices(std::uintptr_t inventory, Entity& entity)
+{
+    entity.inventoryBasePrice = ReadPaintingPrice(inventory, rr::InventoryItemDescriptionModel::BasePriceFunc);
+    const auto sell = ReadPaintingPrice(inventory, rr::InventoryItemDescriptionModel::SellPriceFunc);
+    if (sell) {
+        entity.value = *sell;
+        entity.hasValue = true;
+    }
+    static std::unordered_set<std::string> logged;
+    const std::string inventoryId = ReadIdentifiedId(inventory);
+    const std::string key = entity.label + ":" + inventoryId;
+    if (logged.size() < 32 && logged.insert(key).second)
+        VeoxDiag("painting price: lootId='%s' inventoryId='%s' base=%d sell=%d",
+            entity.label.c_str(), inventoryId.c_str(),
+            entity.inventoryBasePrice.value_or(-1), sell.value_or(-1));
+}
+
+void ReadRandomLootMetadata(std::uintptr_t model, Entity& entity)
+{
+    const auto wrapper = RobRunMemory::ReadPtr(model + rr::RandomLootObjectModel::Item);
+    const auto klass = Il2Cpp::ClassOf(wrapper);
+    if (Il2Cpp::ClassNameOfClass(klass) != "ReferenceData`1" ||
+        Il2Cpp::NamespaceOfClass(klass) != "Framework.Replication.Data.Primitive")
+        return;
+
+    const auto loot = RobRunMemory::ReadPtr(wrapper + rr::ReferenceData::Value);
+    if (!Il2Cpp::IsClass(loot, "LootObjectItemDescription")) return;
+
+    const auto inventory = ResolveLootInventory(loot);
+    const std::string id = ReadIdentifiedId(inventory);
+    if (LooksLikeId(id)) {
+        entity.label = id;
+        ReadInventoryRarity(inventory, entity);
+        if (IsPaintingId(id)) ReadPaintingPrices(inventory, entity);
+    }
+
+    const std::string lootId = ReadIdentifiedId(loot);
+    if (lootId.starts_with("alcohol_") || entity.label.starts_with("alcohol_")) {
+        static std::unordered_set<std::string> logged;
+        const std::string key = std::to_string(entity.id) + ":" + lootId + ":" + entity.label;
+        if (logged.size() < 64 && logged.insert(key).second)
+            VeoxDiag("bottle selection: placement=%d lootId='%s' inventoryId='%s' rarity=%d",
+                entity.id, lootId.c_str(), entity.label.c_str(), entity.rarity);
+    }
+}
+
 void AddDictionaryDescriptionScatter(std::uintptr_t world, std::uintptr_t dictionaryOffset, Kind kind,
     std::uintptr_t descriptionOffset, std::uintptr_t positionOffset, State& out, int& kindCounter)
 {
@@ -291,12 +747,13 @@ void AddDictionaryDescriptionScatter(std::uintptr_t world, std::uintptr_t dictio
     };
     std::vector<ItemWork> work;
     work.reserve(entries.size());
+    const bool lootKindA = IsLootKind(kind);
     for (const auto& e : entries) {
-        if (e.value > 0x10000)
-            work.push_back({ e.key, e.value, 0, {} });
+        if (e.value <= 0x10000) continue;
+        if (lootKindA && IsLootTaken(e.value)) continue;
+        work.push_back({ e.key, e.value, 0, {} });
     }
     if (work.empty()) return;
-
     // Phase 1: scatter read description pointers
     Memory::ScopedScatter sc1(TargetProcess, /*cached=*/true);
     if (sc1) {
@@ -331,8 +788,18 @@ void AddDictionaryDescriptionScatter(std::uintptr_t world, std::uintptr_t dictio
             entity.id = item.id;
             entity.kind = kind;
             entity.position = item.position;
-            std::string name = ReadIdentifiedId(item.desc);
-            entity.label = name.empty() ? KindName(kind) : std::move(name);
+            if (kind == Kind::RandomLoot) {
+                constexpr std::uintptr_t placementEntityId = 0x20;
+                std::int32_t placement = 0;
+                if (!Il2Cpp::IsClass(item.desc, "RandomLootObjectDescription") ||
+                    !RobRunMemory::ReadBytes(item.desc + placementEntityId, &placement, sizeof(placement)) ||
+                    placement != item.id)
+                    continue;
+                ReadRandomLootMetadata(item.model, entity);
+            } else {
+                std::string name = ReadIdentifiedId(item.desc);
+                entity.label = LooksLikeId(name) ? std::move(name) : KindName(kind);
+            }
             out.entities.push_back(std::move(entity));
             ++kindCounter;
             if (out.entities.size() >= 4096) break;
@@ -355,9 +822,11 @@ void AddDictionaryInlineScatter(std::uintptr_t world, std::uintptr_t dictionaryO
     };
     std::vector<ItemWork> work;
     work.reserve(entries.size());
+    const bool lootKindB = IsLootKind(kind);
     for (const auto& e : entries) {
-        if (e.value > 0x10000)
-            work.push_back({ e.key, e.value, {} });
+        if (e.value <= 0x10000) continue;
+        if (lootKindB && IsLootTaken(e.value)) continue;
+        work.push_back({ e.key, e.value, {} });
     }
     if (work.empty()) return;
 
@@ -425,6 +894,73 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
     out.worldPtr = world;
     out.valid = true;
 
+    // Read vehicles FIRST so they are never truncated by the 4096-entity cap
+    // on dense maps with thousands of loot/container objects.
+    AddDictionary(world, rr::WorldEntitiesModel::Cars, Kind::Car,
+        [](std::uintptr_t model, Vector3& position) {
+            const std::uintptr_t transform = RobRunMemory::ReadPtr(
+                model + rr::CarModel::Transform);
+            return ReadVehiclePosition(transform, position);
+        }, out, out.vehicles);
+
+    AddDictionary(world, rr::WorldEntitiesModel::Helicopters, Kind::Helicopter,
+        [](std::uintptr_t model, Vector3& position) {
+            const std::uintptr_t transform = RobRunMemory::ReadPtr(
+                model + rr::HelicopterModel::Transform);
+            return ReadVehiclePosition(transform, position);
+        }, out, out.vehicles);
+
+    // Vehicles describe themselves by model id ("fukurou_spark_9", ...) on the
+    // description object. That id is what the loot filter matches an icon on,
+    // so replace the generic "Car"/"Helicopter" label with it.
+    {
+        std::unordered_map<std::int32_t, std::size_t> idx;
+        for (std::size_t i = 0; i < out.entities.size(); ++i) {
+            const auto k = out.entities[i].kind;
+            if (k == Kind::Car || k == Kind::Helicopter)
+                idx[out.entities[i].id] = i;
+        }
+        auto labelVehicles = [&](std::uintptr_t dictOffset, std::uintptr_t descriptionOffset) {
+            std::vector<RobRunMemory::DictEntry> entries;
+            if (!ReadCollection(world, dictOffset, entries)) return;
+            for (const auto& e : entries) {
+                auto it = idx.find(e.key);
+                if (it == idx.end() || e.value <= 0x10000) continue;
+                const std::uintptr_t desc = RobRunMemory::ReadPtr(e.value + descriptionOffset);
+                std::string id = ReadIdentifiedId(desc);
+                if (!id.empty())
+                    out.entities[it->second].label = std::move(id);
+            }
+        };
+        labelVehicles(rr::WorldEntitiesModel::Cars, rr::CarModel::Description);
+        labelVehicles(rr::WorldEntitiesModel::Helicopters, rr::HelicopterModel::Description);
+    }
+
+    // Also pick up any generic VehicleModel entries not already listed in Cars/Helicopters.
+    {
+        std::unordered_set<int> seenVehIds;
+        seenVehIds.reserve(out.entities.size());
+        for (const auto& e : out.entities) seenVehIds.insert(e.id);
+        std::vector<RobRunMemory::DictEntry> vehEntries;
+        if (ReadCollection(world, rr::WorldEntitiesModel::Vehicles, vehEntries)) {
+            for (const auto& entry : vehEntries) {
+                if (entry.value <= 0x10000 || seenVehIds.count(entry.key)) continue;
+                const std::uintptr_t transform = RobRunMemory::ReadPtr(
+                    entry.value + rr::VehicleModel::Transform);
+                Vector3 position{};
+                if (!ReadVehiclePosition(transform, position)) continue;
+                Entity entity{};
+                entity.id = entry.key;
+                entity.kind = Kind::Vehicle;
+                entity.position = position;
+                entity.label = KindName(Kind::Vehicle);
+                out.entities.push_back(std::move(entity));
+                seenVehIds.insert(entry.key);
+                ++out.vehicles;
+            }
+        }
+    }
+
     const std::size_t containerStart = out.entities.size();
     AddDictionary(world, rr::WorldEntitiesModel::Containers, Kind::Container,
         [](std::uintptr_t model, Vector3& position) {
@@ -456,6 +992,16 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
                 entity.hasEmptyFlag = true;
                 entity.empty = empty;
             }
+
+            // Container type lives behind LocationContainerDescription.ContainerDescriptionFunc;
+            // the description object itself carries only an entity id.
+            const std::uintptr_t desc = RobRunMemory::ReadPtr(
+                entry.value + rr::ContainerModel::Description);
+            const std::uintptr_t containerDesc = ReadFuncIdentifiedTarget(
+                desc, rr::LocationContainerDescriptionModel::ContainerDescriptionFunc);
+            const std::string id = ReadIdentifiedId(containerDesc);
+            if (LooksLikeId(id))
+                out.entities[it->second].label = id;
         }
     }
 
@@ -489,51 +1035,83 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
                 const std::uintptr_t func = RobRunMemory::ReadPtr(
                     desc + rr::StaticLootObjectDescription::LootItemFunc);
                 if (func <= 0x10000) continue;
-                const std::uintptr_t closure = RobRunMemory::ReadPtr(func + 0x10);
-                if (closure <= 0x10000) continue;
-                const std::uintptr_t itemDesc = RobRunMemory::ReadPtr(closure + 0x10);
-                std::string name = ReadIdentifiedId(itemDesc);
-                if (!name.empty())
+                const auto selectedLoot = ResolveDescriptionDelegate(
+                    func, "<>c__DisplayClass35_0", "lootObjectItemDescription");
+                auto& entity = out.entities[it->second];
+                const std::string selectedId = Il2Cpp::IsClass(selectedLoot, "LootObjectItemDescription")
+                    ? ReadIdentifiedId(selectedLoot) : std::string{};
+                const auto target = RobRunMemory::ReadPtr(func + 0x20);
+                const auto lootObjectItem = selectedId.empty() && target > 0x10000
+                    ? RobRunMemory::ReadPtr(target + 0x10) : selectedLoot;
+                if (lootObjectItem <= 0x10000) continue;
+
+                const std::string lootId = ReadIdentifiedId(lootObjectItem);
+                if (IsPaintingId(lootId)) {
+                    entity.label = lootId;
+                    if (lootObjectItem == selectedLoot) {
+                        const auto inventory = ResolveLootInventory(selectedLoot);
+                        ReadInventoryRarity(inventory, entity);
+                        ReadPaintingPrices(inventory, entity);
+                    }
+                    continue;
+                }
+
+                // Second hop: the loot object names the pickup, the inventory
+                // item behind it names the actual tiered item.
+                std::uintptr_t invDesc = ResolveItemDescriptionDeep(lootObjectItem);
+                int basePrice = 0, sellPrice = 0;
+                if (!ReadItemPrices(invDesc, basePrice, sellPrice)) {
+                    // The id-validated hop can miss; a description that yields
+                    // real prices is equally proof it is the item description.
+                    const std::uintptr_t candidate = ReadFuncTarget(
+                        lootObjectItem, rr::LootObjectItemDescriptionModel::ItemDescriptionFunc);
+                    int candBase = 0, candSell = 0;
+                    if (candidate > 0x10000 && ReadItemPrices(candidate, candBase, candSell)) {
+                        invDesc = candidate;
+                        basePrice = candBase;
+                        sellPrice = candSell;
+                    }
+                }
+                // The object actually sitting in the world is the authority on
+                // what it is; the item description behind it only supplies tier
+                // and rarity. Preferring the description first is what labelled
+                // an Eclipse bottle as a Golden Jaguar - one id apart.
+                std::string name = lootId;
+                if (!IsKnownItemId(name)) {
+                    const std::string descId = ReadIdentifiedId(invDesc);
+                    if (IsKnownItemId(descId)) name = descId;
+                    else if (!LooksLikeId(name)) name = descId;
+                }
+                if (LooksLikeId(name))
                     out.entities[it->second].label = std::move(name);
+
+                if (invDesc > 0x10000) {
+                    const std::string descId = ReadIdentifiedId(invDesc);
+                    const std::string shownId = out.entities[it->second].label;
+                    if (LenientEquals(descId, shownId)) {
+                        const int rarity = RobRunMemory::ReadInt32(
+                            invDesc + rr::InventoryItemDescriptionModel::Rarity);
+                        if (rarity > 0 && rarity <= 6)
+                            out.entities[it->second].rarity = rarity;
+                    }
+                }
+
+                if (sellPrice > 0) {
+                    out.entities[it->second].value = sellPrice;
+                    out.entities[it->second].hasValue = true;
+                }
+
+                // One sample, so the shipped sell price can be compared with the
+                // database's number without guessing which one is the buy price.
+                static bool s_loggedPrices = !kProbes;
+                if (!s_loggedPrices && (sellPrice > 0 || basePrice > 0)) {
+                    s_loggedPrices = true;
+                    VeoxDiag("price probe: id='%s' base=%d sell=%d",
+                        ReadIdentifiedId(invDesc).c_str(), basePrice, sellPrice);
+                }
             }
         }
     }
-
-    // Enrich random loot labels with item names
-    // _item wrapper → item desc → Identified.Id
-    {
-        std::vector<RobRunMemory::DictEntry> entries;
-        if (ReadCollection(world, rr::WorldEntitiesModel::RandomLootObjects, entries)) {
-            std::unordered_map<std::int32_t, std::size_t> idx;
-            for (std::size_t i = randomLootStart; i < out.entities.size(); ++i)
-                idx[out.entities[i].id] = i;
-            for (const auto& e : entries) {
-                auto it = idx.find(e.key);
-                if (it == idx.end()) continue;
-                const std::uintptr_t wrapper = RobRunMemory::ReadPtr(
-                    e.value + rr::RandomLootObjectModel::Item);
-                if (wrapper <= 0x10000) continue;
-                const std::uintptr_t itemDesc = RobRunMemory::ReadPtr(wrapper + 0x18);
-                std::string name = ReadIdentifiedId(itemDesc);
-                if (!name.empty())
-                    out.entities[it->second].label = std::move(name);
-            }
-        }
-    }
-
-    AddDictionary(world, rr::WorldEntitiesModel::Cars, Kind::Car,
-        [](std::uintptr_t model, Vector3& position) {
-            const std::uintptr_t transform = RobRunMemory::ReadPtr(
-                model + rr::CarModel::Transform);
-            return ReadVehiclePosition(transform, position);
-        }, out, out.vehicles);
-
-    AddDictionary(world, rr::WorldEntitiesModel::Helicopters, Kind::Helicopter,
-        [](std::uintptr_t model, Vector3& position) {
-            const std::uintptr_t transform = RobRunMemory::ReadPtr(
-                model + rr::HelicopterModel::Transform);
-            return ReadVehiclePosition(transform, position);
-        }, out, out.vehicles);
 
     AddDictionary(world, rr::WorldEntitiesModel::Grenades, Kind::Grenade,
         [](std::uintptr_t model, Vector3& position) {
@@ -546,6 +1124,29 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
     // --- New dump: containers, storage and safes (scatter-accelerated) -
     AddDictionaryDescriptionScatter(world, rr::WorldEntitiesModel::LootNodes, Kind::LootNode,
         rr::LootNodeModel::Description, rr::LootNodeModel::DescriptionPosition, out, out.containers);
+
+    // Loot node type lives behind LocationLootNodeDescription.LootNodeDescriptionFunc;
+    // the description object itself only holds an entity id, not a name.
+    {
+        std::vector<RobRunMemory::DictEntry> entries;
+        if (ReadCollection(world, rr::WorldEntitiesModel::LootNodes, entries)) {
+            std::unordered_map<std::int32_t, std::size_t> idx;
+            for (std::size_t i = 0; i < out.entities.size(); ++i)
+                if (out.entities[i].kind == Kind::LootNode)
+                    idx[out.entities[i].id] = i;
+            for (const auto& e : entries) {
+                auto it = idx.find(e.key);
+                if (it == idx.end() || e.value <= 0x10000) continue;
+                const std::uintptr_t desc = RobRunMemory::ReadPtr(
+                    e.value + rr::LootNodeModel::Description);
+                const std::uintptr_t nodeDesc = ReadFuncIdentifiedTarget(
+                    desc, rr::LocationLootNodeDescriptionModel::LootNodeDescriptionFunc);
+                const std::string id = ReadIdentifiedId(nodeDesc);
+                if (LooksLikeId(id))
+                    out.entities[it->second].label = id;
+            }
+        }
+    }
 
     AddDictionaryDescriptionScatter(world, rr::WorldEntitiesModel::SafeDoors, Kind::SafeDoor,
         rr::SafeDoorModel::Description, rr::SafeDoorModel::DescriptionPosition, out, out.containers);
@@ -624,6 +1225,26 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
             return ReadInlineField(model, rr::DroppedBagModel::InteractPosition, position);
         }, out, out.loots);
 
+    // Contents of vehicle trunks and plot containers/tables, so an item can be
+    // shown in place instead of only when it is lying on the ground.
+    if (ConfigInstance.LootFilter.ReadVehicleInventories) {
+        AddVehicleTrunkContents(world, out.entities);
+        AddPlotContainerContents(world, out.entities);
+    }
+    // Trunk and table contents carry no position of their own: they belong to the
+    // vehicle or container whose dictionary id they share.
+    for (auto& entry : out.entities) {
+        if (!entry.inVehicle && !entry.inTable) continue;
+        for (const auto& parent : out.entities) {
+            if (parent.id != entry.id) continue;
+            if (entry.inVehicle && parent.kind != Kind::Car && parent.kind != Kind::Helicopter) continue;
+            if (entry.inTable && parent.kind != Kind::Container && parent.kind != Kind::PlotContainer) continue;
+            entry.position = parent.position;
+            break;
+        }
+    }
+
+
     // Label dropped bags by role (Robber Bag / Cop Bag)
     {
         std::vector<RobRunMemory::DictEntry> entries;
@@ -670,37 +1291,207 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
         }
     }
 
-    // Cargo with per-type category labels
+    // Cargo census, once per session: which dictionary actually holds cargo.
+    // 0x518 keeps answering "read failed", so walk every cargo-shaped field the
+    // dump exposes and report the one that returns entries.
+    {
+        static bool s_censused = false;
+        if (!s_censused) {
+            s_censused = true;
+            struct Candidate { const char* name; std::uintptr_t offset; };
+            const Candidate candidates[] = {
+                { "Cargos 0x518",              0x518 },
+                { "_cargos 0x0C8",             0x0C8 },
+                { "BuildingCargos 0x558",      0x558 },
+                { "_buildingCargos 0x100",     0x100 },
+                { "CollectionCargos 0x520",    0x520 },
+                { "CargoSpawnPoints 0x260",    0x260 },
+            };
+            for (const auto& c : candidates) {
+                std::vector<RobRunMemory::DictEntry> probe;
+                const bool ok = ReadCollection(world, c.offset, probe);
+                if (kProbes) VeoxDiag("cargo census %-22s raw=%llX read=%d entries=%zu",
+                    c.name, (unsigned long long)RobRunMemory::ReadPtr(world + c.offset),
+                    ok ? 1 : 0, probe.size());
+            }
+        }
+    }
+
+    // Cargo lives in BuildingCargos (0x558): the loose Cargos dictionary reads
+    // as empty on this build while this one carries every cargo on the map.
+    // BuildingStaticCargoModel: description at 0x18, which holds the inline
+    // position (0x24) and a Func<CargoDescription> at 0x30 for the cargo type.
     {
         std::vector<RobRunMemory::DictEntry> entries;
-        if (ReadCollection(world, rr::WorldEntitiesModel::Cargos, entries)) {
-            for (const auto& entry : entries) {
-                const std::uintptr_t model = entry.value;
+        if (ReadCollection(world, rr::WorldEntitiesModel::BuildingCargos, entries)) {
+            for (const auto& e : entries) {
+                const std::uintptr_t model = e.value;
                 if (model <= 0x10000) continue;
 
+                const std::uintptr_t desc = RobRunMemory::ReadPtr(
+                    model + rr::BuildingCargoModel::Description);
+                if (desc <= 0x10000) continue;
+
+                static bool s_probedBuildingCargo = !kProbes;
+                if (!s_probedBuildingCargo) {
+                    s_probedBuildingCargo = true;
+                    if (kProbes) VeoxDiag("probeBuildingCargo: model=%llX desc=%llX",
+                        (unsigned long long)model, (unsigned long long)desc);
+                    ProbeWords("  bc.model", model, 6);
+                    ProbeWords("  bc.desc", desc, 10);
+                    const std::uintptr_t fn = RobRunMemory::ReadPtr(
+                        desc + rr::LocationStaticCargoDescriptionModel::CargoDescriptionFunc);
+                    VeoxDiag("  bc.func0x30=%llX", (unsigned long long)fn);
+                    if (fn > 0x10000) {
+                        const std::uintptr_t target = RobRunMemory::ReadPtr(fn + 0x20);   // delegate target, not method_ptr
+                        ProbeWords("  bc.funcTarget", target, 4);
+                    }
+                    ProbeWords("  bc.data0x10", RobRunMemory::ReadPtr(model + 0x10), 8);
+                }
+
                 Vector3 position{};
-                const std::uintptr_t transform = RobRunMemory::ReadPtr(
-                    model + rr::CargoModel::Transform);
-                if (!ReadVehiclePosition(transform, position) &&
-                    !ReadInlineField(model, rr::CargoModel::InteractPosition, position))
+                if (!RobRunMemory::ReadVector3(
+                        desc + rr::LocationStaticCargoDescriptionModel::Position, position) ||
+                    !ValidPosition(position) ||
+                    (position.x == 0.f && position.y == 0.f && position.z == 0.f))
                     continue;
 
-                std::string name;
-                const std::uintptr_t desc = RobRunMemory::ReadPtr(
-                    model + rr::CargoModel::Description);
-                if (desc > 0x10000)
-                    name = ReadIdentifiedId(desc);
-
-                Kind cargoKind = name.empty() ? Kind::Cargo : ClassifyCargo(name);
-
                 Entity entity{};
-                entity.id = entry.key;
-                entity.kind = cargoKind;
+                entity.id = e.key;
+                entity.kind = Kind::Cargo;
                 entity.position = position;
-                entity.label = name.empty() ? KindName(cargoKind) : std::move(name);
+
+                const std::uintptr_t cargoDesc = ReadFuncIdentifiedTarget(
+                    desc, rr::LocationStaticCargoDescriptionModel::CargoDescriptionFunc);
+                std::uintptr_t typeDesc = cargoDesc;
+                std::string id = ReadIdentifiedId(cargoDesc);
+
+                // Random cargo keeps its type in RandomCargoData (a
+                // ReferenceData<CargoDescription>) at model+0x10 rather than
+                // behind the description func. Probe the reference slots and
+                // accept the first that reads back a real identifier.
+                if (!LooksLikeId(id)) {
+                    const std::uintptr_t data = RobRunMemory::ReadPtr(model + 0x10);
+                    if (data > 0x10000) {
+                        for (const std::uintptr_t off : { (std::uintptr_t)0x10, (std::uintptr_t)0x18,
+                                                          (std::uintptr_t)0x20, (std::uintptr_t)0x28 }) {
+                            const std::uintptr_t candidate = RobRunMemory::ReadPtr(data + off);
+                            const std::string candidateId = ReadIdentifiedId(candidate);
+                            if (LooksLikeId(candidateId)) { id = candidateId; typeDesc = candidate; break; }
+                        }
+                    }
+                }
+                entity.label = LooksLikeId(id) ? id : KindName(Kind::Cargo);
+
+                if (typeDesc > 0x10000) {
+                    const int exchange = RobRunMemory::ReadInt32(
+                        typeDesc + rr::CargoDescriptionModel::ExchangeCoinsReward);
+                    const int arrest = RobRunMemory::ReadInt32(
+                        typeDesc + rr::CargoDescriptionModel::ArrestCoinsReward);
+                    const int value = exchange > 0 ? exchange : arrest;
+                    if (value > 0) { entity.value = value; entity.hasValue = true; }
+                    const int rarity = RobRunMemory::ReadInt32(
+                        typeDesc + rr::CargoDescriptionModel::Rare);
+                    if (rarity > 0 && rarity <= 6) entity.rarity = rarity;
+                }
+
                 out.entities.push_back(std::move(entity));
                 ++out.loots;
                 if (out.entities.size() >= 4096) break;
+            }
+        }
+    }
+
+    // Cargo: the ReadOnly view at 0x518 refuses to open on some builds, so the
+    // plain instance dictionary at 0xC8 is a second chance. Pick whichever
+    // yields entries and use it for both the position pass and the labels.
+    std::uintptr_t cargoOffset = rr::WorldEntitiesModel::Cargos;
+    {
+        std::vector<RobRunMemory::DictEntry> probe;
+        if (!ReadCollection(world, cargoOffset, probe) || probe.empty()) {
+            std::vector<RobRunMemory::DictEntry> alt;
+            if (ReadCollection(world, rr::WorldEntitiesModel::CargosInstance, alt) && !alt.empty())
+                cargoOffset = rr::WorldEntitiesModel::CargosInstance;
+        }
+        static std::uintptr_t s_loggedOffset = 0;
+        if (s_loggedOffset != cargoOffset) {
+            s_loggedOffset = cargoOffset;
+            if (kProbes) VeoxDiag("cargo: using offset 0x%llX", (unsigned long long)cargoOffset);
+        }
+    }
+
+    AddDictionary(world, cargoOffset, Kind::Cargo,
+        [](std::uintptr_t model, Vector3& position) {
+            const std::uintptr_t transform = RobRunMemory::ReadPtr(
+                model + rr::CargoModel::Transform);
+            if (ReadVehiclePosition(transform, position)) return true;
+            return ReadInlineField(model, rr::CargoModel::InteractPosition, position);
+        }, out, out.loots);
+
+    // Cargo carries its type on the description object (CargoDescription ->
+    // EnumItem -> Identified). That id is what the loot filter matches an icon
+    // and a name on, so replace the generic "Cargo" label with it.
+    {
+        std::vector<RobRunMemory::DictEntry> entries;
+        const bool read = ReadCollection(world, cargoOffset, entries);
+        std::size_t matched = 0;
+        if (read) {
+            std::unordered_map<std::int32_t, std::size_t> idx;
+            for (std::size_t i = 0; i < out.entities.size(); ++i)
+                if (out.entities[i].kind == Kind::Cargo)
+                    idx[out.entities[i].id] = i;
+            matched = idx.size();
+            for (const auto& e : entries) {
+                auto it = idx.find(e.key);
+                if (it == idx.end() || e.value <= 0x10000) continue;
+                const std::uintptr_t desc = RobRunMemory::ReadPtr(
+                    e.value + rr::CargoModel::Description);
+                std::string id = ReadIdentifiedId(desc);
+                if (!id.empty())
+                    out.entities[it->second].label = std::move(id);
+
+                // The description also holds the game's coin values for this
+                // cargo type: exchange first (its worth), arrest as a fallback.
+                if (desc > 0x10000) {
+                    const int exchange = RobRunMemory::ReadInt32(
+                        desc + rr::CargoDescriptionModel::ExchangeCoinsReward);
+                    const int arrest = RobRunMemory::ReadInt32(
+                        desc + rr::CargoDescriptionModel::ArrestCoinsReward);
+                    const int value = exchange > 0 ? exchange : arrest;
+                    if (value > 0) {
+                        out.entities[it->second].value = value;
+                        out.entities[it->second].hasValue = true;
+                    }
+                    const int rarity = RobRunMemory::ReadInt32(
+                        desc + rr::CargoDescriptionModel::Rare);
+                    if (rarity > 0 && rarity <= 6)
+                        out.entities[it->second].rarity = rarity;
+                }
+            }
+        }
+
+        // Cargo is the one kind that has never drawn. Log the read result so the
+        // next field report says whether the dictionary is empty or every entry
+        // is being dropped for a bad position.
+        static ULONGLONG s_lastCargoLog = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_lastCargoLog > 5000) {
+            s_lastCargoLog = now;
+            if (!read)
+                if (kProbes) VeoxDiag("cargo: dictionary read FAILED (offset 0x%llX)",
+                    (unsigned long long)rr::WorldEntitiesModel::Cargos);
+            else
+                if (kProbes) VeoxDiag("cargo: entries=%zu placed=%zu", entries.size(), matched);
+
+            static bool s_probedCargo = !kProbes;
+            if (!s_probedCargo) {
+                s_probedCargo = true;
+                const std::uintptr_t field = RobRunMemory::ReadPtr(
+                    world + rr::WorldEntitiesModel::Cargos);
+                if (kProbes) VeoxDiag("probeCargo: world=%llX field(+0x518)=%llX",
+                    (unsigned long long)world, (unsigned long long)field);
+                ProbeWords("  cargo.field", field, 6);
+                ProbeWords("  cargo.count", RobRunMemory::ReadPtr(field + rr::Dict::count), 2);
             }
         }
     }
@@ -747,7 +1538,7 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
                 entity.position = position;
                 entity.cashAmount = cashAmount;
                 entity.hasCashAmount = hasCash;
-                entity.label = name.empty() ? "Cash Node" : std::move(name);
+                entity.label = LooksLikeId(name) ? std::move(name) : std::string("Cash Node");
                 out.entities.push_back(std::move(entity));
                 ++out.valuables;
                 if (out.entities.size() >= 4096) break;
@@ -1022,7 +1813,55 @@ static std::string ReadBuildingName(std::uintptr_t descModelPtr)
     return RobRunMemory::WideToUtf8(wide);
 }
 
-static void ReadDefenseBlock(std::uintptr_t defPtr, BuildingInfo& info)
+static std::uintptr_t ReadDefenseField(std::uintptr_t object, const char* name)
+{
+    Il2Cpp::Field field{};
+    if (!Il2Cpp::FindField(Il2Cpp::ClassOf(object), name, field) || field.offset < 0x10)
+        return 0;
+    return RobRunMemory::ReadPtr(object + field.offset);
+}
+
+static std::optional<BuildingInfo::FuseCounts> ReadFuseCounts(std::uintptr_t slotsModel)
+{
+    std::vector<RobRunMemory::RefDictEntry> slots;
+    if (!RobRunMemory::ReadDictRef(ReadDefenseField(slotsModel, "_slots"), slots))
+        return std::nullopt;
+
+    BuildingInfo::FuseCounts counts;
+    if (slots.empty()) return counts;
+    const auto slotsData = ReadDefenseField(slots.front().value, "_slotsData");
+    std::vector<RobRunMemory::RefDictEntry> modules;
+    if (!RobRunMemory::ReadDictRef(ReadDefenseField(slotsData, "_items"), modules))
+        return std::nullopt;
+
+    std::unordered_map<std::uintptr_t, std::uintptr_t> bySlot;
+    for (const auto& module : modules)
+        bySlot.emplace(module.key, module.value);
+
+    for (const auto& slot : slots) {
+        const auto entry = bySlot.find(slot.key);
+        if (entry == bySlot.end() || !Il2Cpp::IsClass(entry->second, "ReferenceData`1"))
+            return std::nullopt;
+        std::uintptr_t value = 0;
+        if (!RobRunMemory::ReadBytes(entry->second + rr::ReferenceData::Value, &value, sizeof(value)))
+            return std::nullopt;
+        if (!value) continue;
+        if (!Il2Cpp::IsClass(value, "DefenseBlockDefenseModuleDescription"))
+            return std::nullopt;
+
+        constexpr std::uintptr_t moduleDefensePoints = 0x20;
+        int points = 0;
+        if (!RobRunMemory::ReadBytes(value + moduleDefensePoints, &points, sizeof(points)))
+            return std::nullopt;
+        if (points == 1) ++counts.onePoint;
+        else if (points == 3) ++counts.threePoints;
+        else ++counts.other;
+    }
+    return counts;
+}
+
+static void ReadDefenseBlock(std::uintptr_t defPtr, BuildingInfo& info,
+    const std::unordered_map<int, std::uintptr_t>& privateBlocks)
 {
     if (defPtr <= 0x10000) return;
     info.hasDefense = true;
@@ -1035,6 +1874,40 @@ static void ReadDefenseBlock(std::uintptr_t defPtr, BuildingInfo& info)
 
     const std::uintptr_t lockW = RobRunMemory::ReadPtr(defPtr + rr::DefenseBlockPublicModel::RaidLockTs);
     if (lockW > 0x10000) Il2Cpp::ReadPrimitiveInt64(lockW, info.raidLockTs);
+
+    if (privateBlocks.empty()) return;
+    const auto descriptionModel = RobRunMemory::ReadPtr(
+        defPtr + rr::DefenseBlockPublicModel::DescriptionModel);
+    const auto description = RobRunMemory::ReadPtr(descriptionModel + 0x10);
+    if (!Il2Cpp::IsClass(description, "LocationDefenseBlockDescription")) return;
+
+    constexpr std::uintptr_t locationEntityIds = 0x20;
+    constexpr std::uintptr_t privateEntityId = 0x14;
+    const auto ids = RobRunMemory::ReadPtr(description + locationEntityIds);
+    int id = 0;
+    if (!Il2Cpp::IsClass(ids, "DefenseBlockEntityIds") ||
+        !RobRunMemory::ReadBytes(ids + privateEntityId, &id, sizeof(id)))
+        return;
+    const auto match = privateBlocks.find(id);
+    if (match == privateBlocks.end()) return;
+    const auto block = match->second;
+    if (!Il2Cpp::IsClass(block, "DefenseBlockPrivateModel")) return;
+
+    constexpr std::uintptr_t privateBlockId = 0x10;
+    constexpr std::uintptr_t baseDefensePoints = 0x14;
+    constexpr std::uintptr_t defenseModuleSlots = 0x18;
+    constexpr std::uintptr_t defensePointsModel = 0x28;
+    int observedId = 0;
+    if (!RobRunMemory::ReadBytes(block + privateBlockId, &observedId, sizeof(observedId)) ||
+        observedId != id)
+        return;
+
+    int points = 0;
+    if (RobRunMemory::ReadBytes(block + baseDefensePoints, &points, sizeof(points)) && points >= 0)
+        info.baseDefensePoints = points;
+    if (Il2Cpp::ReadPrimitiveInt(RobRunMemory::ReadPtr(block + defensePointsModel), points) && points >= 0)
+        info.defensePoints = points;
+    info.fuses = ReadFuseCounts(RobRunMemory::ReadPtr(block + defenseModuleSlots));
 }
 
 static int CountDoors(std::uintptr_t doorsDict, int& openCount)
@@ -1069,7 +1942,7 @@ static int CountDoors(std::uintptr_t doorsDict, int& openCount)
     return total;
 }
 
-bool ReadPlots(std::uintptr_t battleEntities, PlotState& out)
+bool ReadPlots(std::uintptr_t battleEntities, std::uintptr_t world, PlotState& out)
 {
     out = PlotState{};
     if (battleEntities <= 0x10000) return false;
@@ -1081,6 +1954,16 @@ bool ReadPlots(std::uintptr_t battleEntities, PlotState& out)
     std::vector<RobRunMemory::DictEntry> plotEntries;
     if (!RobRunMemory::ReadDictInt(plotsDict, plotEntries, false) || plotEntries.empty())
         return false;
+
+    std::unordered_map<int, std::uintptr_t> privateBlocks;
+    if (world > 0x10000) {
+        constexpr std::uintptr_t defenseBlockPrivateModels = 0x700;
+        std::vector<RobRunMemory::DictEntry> entries;
+        if (ReadCollection(world, defenseBlockPrivateModels, entries)) {
+            for (const auto& entry : entries)
+                privateBlocks.emplace(entry.key, entry.value);
+        }
+    }
 
     for (const auto& pe : plotEntries) {
         const std::uintptr_t pm = pe.value;
@@ -1121,7 +2004,7 @@ bool ReadPlots(std::uintptr_t battleEntities, PlotState& out)
 
             ReadDefenseBlock(
                 RobRunMemory::ReadPtr(mainBld + rr::MainBuildingModel::DefenseBlockPublicModel),
-                plot.mainBuilding);
+                plot.mainBuilding, privateBlocks);
 
             const std::uintptr_t doorsD = RobRunMemory::ReadPtr(mainBld + rr::MainBuildingModel::Doors);
             plot.mainBuilding.doorCount = CountDoors(doorsD, plot.mainBuilding.doorsOpen);
@@ -1136,7 +2019,7 @@ bool ReadPlots(std::uintptr_t battleEntities, PlotState& out)
 
             ReadDefenseBlock(
                 RobRunMemory::ReadPtr(wallBld + rr::CompoundWallModel::DefenseBlockPublicModel),
-                plot.compoundWall);
+                plot.compoundWall, privateBlocks);
 
             const std::uintptr_t doorsD = RobRunMemory::ReadPtr(wallBld + rr::CompoundWallModel::Doors);
             plot.compoundWall.doorCount = CountDoors(doorsD, plot.compoundWall.doorsOpen);
@@ -1156,7 +2039,7 @@ bool ReadPlots(std::uintptr_t battleEntities, PlotState& out)
 
                     ReadDefenseBlock(
                         RobRunMemory::ReadPtr(oe.value + rr::OutbuildingModel::DefenseBlockPublicModel),
-                        ob);
+                        ob, privateBlocks);
 
                     const std::uintptr_t doorsD = RobRunMemory::ReadPtr(
                         oe.value + rr::OutbuildingModel::Doors);
@@ -1174,6 +2057,56 @@ bool ReadPlots(std::uintptr_t battleEntities, PlotState& out)
 
     out.valid = !out.plots.empty();
     return out.valid;
+}
+
+std::string FormatLootDump(const State& state, std::string_view filter)
+{
+    std::ostringstream rows;
+    const auto lowerFilter = LootFilterConfig::Lower(std::string(filter));
+    std::size_t selectedIndex = 0;
+    bool selectIndex = false;
+    if (!filter.empty()) {
+        const auto parse = std::from_chars(filter.data(), filter.data() + filter.size(), selectedIndex);
+        selectIndex = parse.ec == std::errc{} && parse.ptr == filter.data() + filter.size();
+    }
+    std::size_t total = 0, empty = 0, unresolved = 0, exported = 0;
+    const auto& settings = ConfigInstance.LootFilter;
+    for (const auto& entity : state.entities) {
+        if (!IsLootKind(entity.kind) && entity.kind != Kind::LootNode &&
+            entity.kind != Kind::CashLootNode && entity.kind != Kind::Cargo &&
+            entity.kind != Kind::Container && entity.kind != Kind::PlotLoot &&
+            entity.kind != Kind::FurnitureLoot && entity.kind != Kind::BuildingLoot)
+            continue;
+        const auto index = total++;
+        if (entity.hasEmptyFlag && entity.empty) ++empty;
+        const auto* def = settings.FindItemForEntity(entity.kind, entity.label);
+        const bool mapped = def && def->labelMatch[0];
+        if (!mapped) ++unresolved;
+        const std::string name = mapped ? def->displayName : entity.label;
+        if (selectIndex ? index != selectedIndex :
+            !lowerFilter.empty() &&
+            LootFilterConfig::Lower(name).find(lowerFilter) == std::string::npos &&
+            LootFilterConfig::Lower(entity.label).find(lowerFilter) == std::string::npos)
+            continue;
+        ++exported;
+        rows << index << '\t' << entity.id << '\t' << KindName(entity.kind) << '\t'
+             << std::quoted(entity.label) << '\t' << std::quoted(name) << '\t'
+             << (mapped ? def->id : "") << '\t' << (mapped ? def->iconSprite : "") << '\t'
+             << entity.position.x << '\t' << entity.position.y << '\t' << entity.position.z << '\t';
+        if (entity.hasEmptyFlag) rows << (entity.empty ? "empty" : "present");
+        rows << '\t';
+        if (entity.inventoryBasePrice) rows << *entity.inventoryBasePrice;
+        rows << '\t';
+        if (IsPaintingId(entity.label) && entity.hasValue) rows << entity.value;
+        rows << '\n';
+    }
+
+    std::ostringstream out;
+    out << "Published loot: " << total << " | empty: " << empty
+        << " | unmapped: " << unresolved << " | exported: " << exported << '\n';
+    out << "index\tplacement\tkind\traw_id\tname\trow\tsprite\tx\ty\tz\tstate\tbase_price\tsell_price\n";
+    out << rows.str();
+    return out.str();
 }
 
 std::vector<ProbeResult> ProbeMoneyModels(std::uintptr_t worldPtr)

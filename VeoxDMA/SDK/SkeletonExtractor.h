@@ -35,6 +35,20 @@ struct BonePoints {
 
 using ReadFn = std::function<bool(uint64_t, void*, std::size_t)>;
 
+// Verified native Transform ownership, shared by skeleton and camera writes.
+struct TransformTarget {
+    std::uint64_t native = 0;
+    std::uint64_t hierarchy = 0;
+    std::uint64_t matrices = 0;
+    std::uint64_t parents = 0;
+    std::uint64_t owners = 0;
+    std::uint64_t countAddress = 0;
+    int count = 0;
+    int index = -1;
+};
+bool ResolveNativeTransform(std::uint64_t native, const ReadFn& read, TransformTarget& out);
+
+
 // Everything about a rig that stays constant while the character exists:
 // the animation-matrix array, the bone parent table and which bones form the
 // skeleton. Resolving this requires class-name and pointer walks, so it is
@@ -135,6 +149,12 @@ inline std::size_t PoseDataSize(const RigLayout& layout) {
 // Convenience one-shot extraction (layout build + sample).
 std::vector<BoneSegment> BuildFromView(
     std::uint64_t view, const ReadFn& read);
+
+// Looks up the BattleCharacterEntityView pointer for an entityId via the
+// active BattleEntitiesUpdater dictionary. Returns 0 if not found.
+std::uint64_t FindEntityView(
+    std::uint64_t game, std::uint64_t battleModel,
+    std::int32_t entityId, const ReadFn& read);
 
 // Fallback used when the view pointer is unknown: walks the active updater to
 // find the entity view, then extracts the rig.

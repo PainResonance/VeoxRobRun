@@ -24,6 +24,8 @@ public:
 	int MinValueFilter = 0;
 
 	bool InstantLoot = false;
+	bool Freecam = false;
+	float FreecamSpeed = 4.f;
 	bool InstantUnlock = false;
 
 	// Per-collection toggles for the new metadata dump. The group flags above
@@ -52,6 +54,10 @@ public:
 	bool SettlementCash = true;
 	bool MoneyWorkbenches = true;
 	bool SecurityAlarms = true;
+	static constexpr int MinSecurityAlarmIconSize = 8;
+	static constexpr int MaxSecurityAlarmIconSize = 128;
+	static constexpr int DefaultSecurityAlarmIconSize = 70;
+	int SecurityAlarmIconSize = DefaultSecurityAlarmIconSize;
 	bool FirstAidCabinets = true;
 	bool CryptoWorkbenches = true;
 	bool VehicleTrunks = true;
@@ -140,6 +146,7 @@ public:
 		j[ConfigName][LIT("FontSize")] = FontSize;
 		j[ConfigName][LIT("MinValueFilter")] = MinValueFilter;
 		j[ConfigName][LIT("InstantLoot")] = InstantLoot;
+		j[ConfigName][LIT("FreecamSpeed")] = FreecamSpeed;
 		j[ConfigName][LIT("InstantUnlock")] = InstantUnlock;
 
 		ToJsonBool(&j, LIT("LootNodes"), LootNodes);
@@ -165,6 +172,7 @@ public:
 		ToJsonBool(&j, LIT("SettlementCash"), SettlementCash);
 		ToJsonBool(&j, LIT("MoneyWorkbenches"), MoneyWorkbenches);
 		ToJsonBool(&j, LIT("SecurityAlarms"), SecurityAlarms);
+		j[ConfigName][LIT("SecurityAlarmIconSize")] = SecurityAlarmIconSize;
 		ToJsonBool(&j, LIT("FirstAidCabinets"), FirstAidCabinets);
 		ToJsonBool(&j, LIT("CryptoWorkbenches"), CryptoWorkbenches);
 		ToJsonBool(&j, LIT("VehicleTrunks"), VehicleTrunks);
@@ -226,6 +234,7 @@ public:
 		FontSize = j[ConfigName].value(LIT("FontSize"), FontSize);
 		MinValueFilter = j[ConfigName].value(LIT("MinValueFilter"), MinValueFilter);
 		InstantLoot = j[ConfigName].value(LIT("InstantLoot"), InstantLoot);
+		FreecamSpeed = std::clamp(j[ConfigName].value(LIT("FreecamSpeed"), 4.f), 0.5f, 60.f);
 		InstantUnlock = j[ConfigName].value(LIT("InstantUnlock"), InstantUnlock);
 
 		FromJsonBool(j, LIT("LootNodes"), &LootNodes);
@@ -251,6 +260,9 @@ public:
 		FromJsonBool(j, LIT("SettlementCash"), &SettlementCash);
 		FromJsonBool(j, LIT("MoneyWorkbenches"), &MoneyWorkbenches);
 		FromJsonBool(j, LIT("SecurityAlarms"), &SecurityAlarms);
+		SecurityAlarmIconSize = std::clamp(
+			j[ConfigName].value(LIT("SecurityAlarmIconSize"), DefaultSecurityAlarmIconSize),
+			MinSecurityAlarmIconSize, MaxSecurityAlarmIconSize);
 		FromJsonBool(j, LIT("FirstAidCabinets"), &FirstAidCabinets);
 		FromJsonBool(j, LIT("CryptoWorkbenches"), &CryptoWorkbenches);
 		FromJsonBool(j, LIT("VehicleTrunks"), &VehicleTrunks);

@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <optional>
 #include <vector>
 #include <unordered_set>
 #include "../Misc/Vector.h"
@@ -58,8 +60,14 @@ struct Entity {
     std::string label;
     int cashAmount = 0;
     bool hasCashAmount = false;
+        bool inVehicle = false;     // contents of a vehicle trunk
+        bool inTable = false;       // contents of a container or grow table
     int dirtyCash = 0;
     int cleanCash = 0;
+    int value = 0;              // game-native value (cargo coin reward), 0 if none
+    bool hasValue = false;
+    std::optional<int> inventoryBasePrice;
+    int rarity = -1;            // RarityItem enum from the description: 0 none, 1..6 tiers
     float yaw = 0.f;
     bool hasYaw = false;
 };
@@ -90,6 +98,14 @@ struct BuildingInfo {
     std::int64_t raidLockTs = 0;
     int doorCount = 0;
     int doorsOpen = 0;
+    std::optional<int> baseDefensePoints;
+    std::optional<int> defensePoints;
+    struct FuseCounts {
+        int onePoint = 0;
+        int threePoints = 0;
+        int other = 0;
+    };
+    std::optional<FuseCounts> fuses;
 };
 
 struct PlotInfo {
@@ -132,7 +148,12 @@ void Init(std::uintptr_t gameAssemblyBase);
 bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out);
 
 const char* KindName(Kind kind);
+bool IsPaintingId(std::string_view id);
 
-bool ReadPlots(std::uintptr_t battleEntities, PlotState& out);
+bool ReadPlots(std::uintptr_t battleEntities, std::uintptr_t world, PlotState& out);
+
+// Empty filter lists the complete published loot snapshot. Numeric filters
+// select the absolute row index, and text filters match names or item IDs.
+std::string FormatLootDump(const State& state, std::string_view filter);
 
 } // namespace RobRunWorld

@@ -120,6 +120,9 @@ VeoxDMA/
 │   ├── RobRunSDK.h          # Verified IL2CPP class offsets & struct definitions
 │   └── WorldEntities.h/cpp  # World loot, table traversal, container parsing
 └── UI/                  # VeoxMenu interactive settings interface
+OrbitResources/         # Resource-only DLL carrying the loot filter icon set
+tools/
+└── loot/               # Loot catalog and icon generators (see tools/loot/README.md)
 ```
 
 ---
@@ -143,10 +146,18 @@ MSBuild.exe VeoxDMA.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformTool
 The compiled binary will be placed in:
 `Build/Release/VeoxDMA/VeoxDMA.exe`
 
+### Offline demo and checks
+
+- Run `VeoxDMA.exe --demo` to preview the player overlay with three synthetic players. Press Escape to close it.
+- Run `VeoxDMA.exe --selftest` to check config persistence, projection, demo poses, and loot export filtering. Results are written to `veox-diag.log`. The process returns a nonzero exit code on failure.
+- From the loot filter menu, use **Export loot snapshot** to save a TSV of the last published world snapshot. Enter an item name, ID, or zero-based row index to narrow it down. Leave the field blank to export every loot row.
+- The house HUD shows fuse counts and current/base defense points for buildings whose private defense data is present in the snapshot.
+
 ### Runtime Dependencies
 Ensure the following files reside in the working directory next to `VeoxDMA.exe`:
 - `vmm.dll` & `leechcore.dll` (PCILeech DMA libraries)
 - `FTD3XX.dll` (FTDI SuperSpeed USB driver)
+- `OrbitResources.dll` (Loot filter icons, committed in `Lib/`; the build copies it next to the exe. To regenerate it see [Updating OrbitResources.dll](tools/loot/README.md#updating-orbitresourcesdll))
 - `city_colliders.bvh` (Map collider geometry for line-of-sight verification)
 - `maps/` (Radar minimap textures: `looty_bay.png`, `hangar.png`, etc.)
 

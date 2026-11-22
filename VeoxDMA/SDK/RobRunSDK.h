@@ -158,6 +158,31 @@ inline constexpr std::uintptr_t CoinsModel                 = 0x4A8;
 inline constexpr std::uintptr_t CryptoCoinsModel           = 0x4B0;
 inline constexpr std::uintptr_t DelayedUseAction           = 0x610;
 inline constexpr std::uintptr_t BattleSettings             = 0x98;
+inline constexpr std::uintptr_t MapDialogModel             = 0x1D8;
+inline constexpr std::uintptr_t MapConfigModel             = 0x1E8;
+}
+
+namespace ScreenModel {
+inline constexpr std::uintptr_t ScreenState = 0x10; // int32: 0=Closed, 1=Opened
+inline constexpr std::uintptr_t Intention   = 0x14; // int32: 0=None, 1=Open, 2=Close
+}
+
+namespace MapConfigModel {
+inline constexpr std::uintptr_t MapDialogModel = 0x10;
+inline constexpr std::uintptr_t FullScreen     = 0x18; // MapConfigVariance*
+inline constexpr std::uintptr_t Minimap        = 0x20; // MapConfigVariance*
+inline constexpr std::uintptr_t MapModel       = 0x28; // MapModel*
+}
+
+namespace MapConfigVariance {
+inline constexpr std::uintptr_t Position        = 0x10; // Vector2 (world X, Z)
+inline constexpr std::uintptr_t Rotation        = 0x18; // float
+inline constexpr std::uintptr_t CameraSize      = 0x1C; // float (ortho half-height)
+inline constexpr std::uintptr_t ResizeContainer = 0x20; // RectTransform*
+}
+
+namespace MapModel {
+inline constexpr std::uintptr_t NormalizedZoom = 0x18; // float (0..1)
 }
 
 namespace BattleSettingsDescription {
@@ -424,8 +449,17 @@ inline constexpr std::uint32_t BattlePlayerCapacity = 320;
 // Active view updater (live verified)
 // ------------------------------------------------------------------
 namespace BattleEntitiesUpdater {
-inline constexpr std::uintptr_t _battleModel          = 0x70;
-inline constexpr std::uintptr_t _characterEntityViews = 0x110; // Dictionary<int, view>
+inline constexpr std::uintptr_t _battleScreenContent        = 0x68;  // BattleScreenContent
+inline constexpr std::uintptr_t _battleModel                = 0x70;
+inline constexpr std::uintptr_t _globalModel                = 0x78;  // GlobalModel
+inline constexpr std::uintptr_t _entitiesModelsUpdaters     = 0x30;  // Dictionary<int, IUpdater>
+inline constexpr std::uintptr_t _entitiesViewsUpdaters      = 0x38;  // Dictionary<int, IUpdater>
+inline constexpr std::uintptr_t _mixingCameraBlendUpdater   = 0x100; // MixingCameraBlendUpdater
+inline constexpr std::uintptr_t _characterEntityViews       = 0x110; // Dictionary<int, view>
+}
+
+namespace BattleScreenContent {
+inline constexpr std::uintptr_t RevealViewDescriptions      = 0x540; // InventoryRevealViewDescriptions
 }
 
 // Updater list chain:
@@ -527,10 +561,22 @@ inline constexpr float DefaultFovDeg        = 60.0f;
 
 namespace Cinemachine {
 // CinemachineCore class -> static_fields(+0xB8) -> core instance at +0x08
-inline constexpr std::uintptr_t CoreInstance = 0x08;
-inline constexpr std::uintptr_t BrainList    = 0x10; // List<CinemachineBrain>
-inline constexpr std::uintptr_t BrainFov      = 0xB0; // vertical FOV degrees
-inline constexpr std::uintptr_t BrainStateLensFov = 0xB0; // new offset set alias
+inline constexpr std::uintptr_t CoreInstance          = 0x08;
+inline constexpr std::uintptr_t BrainList             = 0x10; // List<CinemachineBrain>
+inline constexpr std::uintptr_t BrainActiveCameraPrev = 0xA0; // Brain.mActiveCameraPreviousFrame
+inline constexpr std::uintptr_t BrainFov              = 0xB0; // vertical FOV degrees
+inline constexpr std::uintptr_t BrainStateLensFov     = 0xB0; // new offset set alias
+}
+
+namespace Fov {
+inline constexpr std::uintptr_t BrainActiveCamera = 0xA0;  // Brain.mActiveCameraPreviousFrame
+inline constexpr std::uintptr_t VcamLensFov       = 0xB8;  // VirtualCamera.m_Lens.FieldOfView
+inline constexpr std::uintptr_t MixCameras        = 0xA8;  // MixingCamera._cameras List
+inline constexpr std::uintptr_t MixupMixer        = 0x10;  // MixingCameraBlendUpdater._mixingCamera
+inline constexpr std::uintptr_t BeuMixup          = 0x100; // BattleEntitiesUpdater._mixingCameraBlendUpdater
+inline constexpr std::uintptr_t BeuUpdaters       = 0x30;  // BattleEntitiesUpdater._entitiesModelsUpdaters dict
+inline constexpr std::uintptr_t BeuViewUpdaters   = 0x38;  // BattleEntitiesUpdater._entitiesViewsUpdaters dict
+inline constexpr std::uintptr_t AimBrain          = 0x48;  // BattleAimTargetUpdater._cinemachineBrain
 }
 
 // ------------------------------------------------------------------
@@ -653,8 +699,7 @@ inline constexpr std::uintptr_t EntityId = 0x28; // wrapper
 // World entities (metadata)
 // ------------------------------------------------------------------
 namespace WorldEntitiesModel {
-inline constexpr std::uintptr_t NotSpawnedBattleCharacters = 0x480;
-inline constexpr std::uintptr_t BattleCharacters           = 0x488;
+inline constexpr std::uintptr_t NotSpawnedBattleCharacters = 0x480;inline constexpr std::uintptr_t BattleCharacters           = 0x488;
 inline constexpr std::uintptr_t Containers                 = 0x490;
 inline constexpr std::uintptr_t AccessEntities             = 0x498;
 inline constexpr std::uintptr_t SecurityAlarms             = 0x5E0;
@@ -671,6 +716,8 @@ inline constexpr std::uintptr_t RandomLootObjects          = 0x4F8;
 inline constexpr std::uintptr_t LootNodes                  = 0x500;
 inline constexpr std::uintptr_t VehicleTrunks              = 0x510;
 inline constexpr std::uintptr_t Cargos                     = 0x518;
+inline constexpr std::uintptr_t CargosInstance             = 0x0C8; // plain Dictionary, fallback when the ReadOnly view will not open
+inline constexpr std::uintptr_t BuildingCargos             = 0x558; // ReadOnly.Dictionary<int, IBuildingCargoModel> - the one that actually yields cargo
 inline constexpr std::uintptr_t CollectionTables           = 0x528;
 inline constexpr std::uintptr_t SafeDoors                  = 0x5C8;
 inline constexpr std::uintptr_t StorageBoxes               = 0x560;
@@ -855,6 +902,22 @@ inline constexpr std::uintptr_t Item        = 0x18; // IPrimitiveData<LootObject
 inline constexpr std::uintptr_t Description = 0x20; // V3 position at +0x24
 }
 
+// LootObjectItemDescription (EnumItem) -> Func<InventoryItemDescription> at 0x20.
+// Following it is what yields the tiered item id ("starh_m2") and its rarity.
+namespace LootObjectItemDescriptionModel {
+inline constexpr std::uintptr_t ItemDescriptionFunc = 0x20;
+}
+
+namespace LocationLootNodeDescriptionModel {
+inline constexpr std::uintptr_t LootNodeDescriptionFunc = 0x28; // Func<LootNodeDescription>
+inline constexpr std::uintptr_t Position                = 0x38;
+}
+
+namespace LocationContainerDescriptionModel {
+inline constexpr std::uintptr_t ContainerDescriptionFunc = 0x28; // Func<ContainerDescription>
+inline constexpr std::uintptr_t Position                 = 0x30;
+}
+
 namespace VehicleModel {
 inline constexpr std::uintptr_t Transform   = 0x28;
 inline constexpr std::uintptr_t Description = 0x118;
@@ -980,9 +1043,38 @@ inline constexpr std::uintptr_t HasCargo         = 0x38; // IPrimitiveModel<bool
 }
 
 namespace CargoModel {
-inline constexpr std::uintptr_t Description      = 0x10; // speculative — IdentifiedBase
+inline constexpr std::uintptr_t Description      = 0x28; // CargoDescription (EnumItem -> Identified)
 inline constexpr std::uintptr_t Transform        = 0x30;
 inline constexpr std::uintptr_t InteractPosition = 0x38;
+}
+
+// CargoDescription is an EnumItem (id string at IdentifiedBase::Id) that also
+// carries the game's own coin values for that cargo type.
+namespace BuildingCargoModel {
+inline constexpr std::uintptr_t Description = 0x18; // LocationStaticCargoDescription / LocationRandomCargoDescription
+}
+
+namespace LocationStaticCargoDescriptionModel {
+inline constexpr std::uintptr_t Position            = 0x24; // inline Vector3
+inline constexpr std::uintptr_t CargoDescriptionFunc = 0x30; // Func<CargoDescription>
+}
+
+namespace CargoDescriptionModel {
+inline constexpr std::uintptr_t Rare                 = 0x20; // RarityItem (int enum)
+inline constexpr std::uintptr_t ArrestCoinsReward    = 0x30; // int32
+inline constexpr std::uintptr_t ExchangeCoinsReward  = 0x34; // int32
+}
+
+// RarityItem: 0 none, 1 Common, 2 Uncommon, 3 Rare, 4 Epic, 5 Legendary, 6 Exotic.
+namespace InventoryItemDescriptionModel {
+inline constexpr std::uintptr_t Rarity               = 0x30; // RarityItem (int enum)
+inline constexpr std::uintptr_t BasePriceFunc        = 0x78; // Func<int>
+inline constexpr std::uintptr_t SellPriceModifierFunc = 0x80; // Func<InventoryItemSellPriceModifier>
+inline constexpr std::uintptr_t SellPriceFunc        = 0x88; // Func<int> - the price the game pays
+}
+
+namespace InventoryItemSellPriceModifierModel {
+inline constexpr std::uintptr_t Modifier = 0x20; // float
 }
 
 namespace PlotLootModel {
@@ -1088,29 +1180,32 @@ inline constexpr std::uintptr_t Progress = 0x18; // float
 }
 
 namespace ProlongedInteractionModel {
-inline constexpr std::uintptr_t EndTs = 0x18; // TimestampData (+0x18 i64)
+inline constexpr std::uintptr_t EntityId = 0x10; // IPrimitiveData<int> (_value at +0x18)
+inline constexpr std::uintptr_t EndTs    = 0x18; // IPrimitiveData<long> / TimestampData (_value at +0x18)
+inline constexpr std::uintptr_t DataValue = 0x18; // BasePrimitiveData<T>._value
 }
 
 namespace DelayedUseActionModel {
 inline constexpr std::uintptr_t StartTs = 0x18; // float
+inline constexpr std::uintptr_t Action  = 0x20; // System.Action*
 inline constexpr std::uintptr_t EndTs   = 0x28; // float
 }
 
 namespace AutoLootAfterBreakModel {
-inline constexpr std::uintptr_t AutoLootEndTs = 0x28; // float
+inline constexpr std::uintptr_t AutoLootEntityId = 0x10; // int
+inline constexpr std::uintptr_t AutoLootEndTs    = 0x28; // float
 }
 
 namespace InventoryRevealViewDescriptions {
-inline constexpr std::uintptr_t Items    = 0x10; // List<Pair> _items
-inline constexpr std::uintptr_t Size     = 0x18; // int _size
-inline constexpr std::uintptr_t Data     = 0x20; // array base
-inline constexpr std::uintptr_t Stride   = 0x18;
-inline constexpr std::uintptr_t PairDesc = 0x10; // Pair -> Description
-inline constexpr std::uintptr_t ScanTime = 0x58; // Description.TimeToOneCellBorder (f32)
-inline constexpr std::uintptr_t ShineView     = 0x18; // Description -> ShineView
-inline constexpr std::uintptr_t ShineDuration = 0x28; // ShineView.Duration (f32)
-inline constexpr std::uintptr_t IconView      = 0x50; // Description -> IconView
-inline constexpr std::uintptr_t IconDuration  = 0x18; // IconView.Duration (f32)
+// Inherits ScriptableObject (m_CachedPtr at +0x10); _list is at +0x18.
+inline constexpr std::uintptr_t List               = 0x18; // List<Pair> _list
+inline constexpr std::uintptr_t TimeToOneCellBorder = 0x58; // float on InventoryRevealViewDescriptions
+inline constexpr std::uintptr_t Stride             = 0x18; // sizeof(Pair): _id(0x0), Rarity(0x8), Description(0x10)
+inline constexpr std::uintptr_t PairDesc           = 0x10; // Pair -> RevealViewDescription*
+inline constexpr std::uintptr_t ShineView          = 0x18; // inline RevealShineFxSettings on RevealViewDescription
+inline constexpr std::uintptr_t ShineDuration      = 0x28; // RevealShineFxSettings.Duration (desc + 0x40)
+inline constexpr std::uintptr_t IconView           = 0x50; // inline IconRevealFxSettings on RevealViewDescription
+inline constexpr std::uintptr_t IconDuration       = 0x18; // IconRevealFxSettings.Duration (desc + 0x68)
 }
 
 namespace RadiusInteractEntityModel {

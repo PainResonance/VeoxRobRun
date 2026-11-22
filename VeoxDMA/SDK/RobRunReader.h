@@ -81,6 +81,30 @@ struct EntityData {
     int boneCount = 0;
 };
 
+// Live state of one in-game map viewport (top-left minimap or fullscreen 'M'
+// map), read directly from BattleModel.MapConfigModel.
+struct InGameMapVariance {
+    bool valid = false;
+    Vector2 position{};    // World (X, Z) center of the orthographic map camera
+    float rotation = 0.f;  // Live map camera rotation
+    float cameraSize = 0.f; // Orthographic half-height in world metres
+    bool rectValid = false;
+    // Screen-space bounding box in Unity UI Canvas pixels (Y=0 at bottom) and
+    // Canvas reference resolution so the overlay scales to any display size.
+    float uiMinX = 0.f, uiMinY = 0.f, uiMaxX = 0.f, uiMaxY = 0.f;
+    float uiCenterX = 0.f, uiCenterY = 0.f;
+    float uiScaleX = 1.f, uiScaleY = 1.f;
+    float uiScreenW = 0.f, uiScreenH = 0.f;
+};
+
+struct InGameMapState {
+    bool valid = false;
+    bool fullscreenOpen = false;
+    float normalizedZoom = 0.f;
+    InGameMapVariance minimap;
+    InGameMapVariance fullscreen;
+};
+
 // Immutable view of the last completed read pass. The worker publishes a new
 // snapshot every cycle; the overlay thread only ever reads one. This is what
 // keeps DMA latency off the render thread.
@@ -93,6 +117,7 @@ struct Snapshot {
     std::shared_ptr<const RobRunWorld::PlotState> plots;
     std::shared_ptr<const RobRunInventory::State> inventory;
     RobRunCamera::CameraState camera;
+    InGameMapState inGameMap;
     std::int32_t localEntityId = -1;
     Vector3 localPosition{};
     float localYaw = 0.f;
@@ -161,10 +186,15 @@ void Update();
 // caller uses it even if the worker publishes a newer one.
 SnapshotPtr GetSnapshot();
 
+// The standalone demo supplies its own immutable render data.
+void PublishDemoSnapshot(SnapshotPtr snapshot);
+
 std::int32_t GetLocalEntityId();
 Vector3 GetLocalPosition();
 float GetLocalYaw();
 std::uintptr_t GetGamePtr();
+// Bounded traversal of the active updater list and its owning updater chain.
+std::uintptr_t FindActiveUpdaterByName(std::uintptr_t game, const char* name);
 std::uintptr_t GetBattleModelPtr();
 std::uintptr_t GetLocalCharacterPtr();
 std::uintptr_t GetCameraModelPtr();
@@ -200,6 +230,18 @@ bool GetFallbackViewProjection(Matrix4x4& out);
 // verified managed camera first, the native Unity camera fallback second, so
 // every consumer projects with the same answer.
 bool ResolveViewProjection(Matrix4x4& out, int screenWidth, int screenHeight);
+
+// Latches the newest view-projection matrix once at the start of a render
+// pass so every draw callback in that frame (players, world, BVH, aim) shares
+// an identical camera timestamp without re-multiplying matrices.
+void BeginRenderFrame(int screenWidth, int screenHeight);
+void EndRenderFrame();
+
+// Lightweight render-thread feedback telling the worker whether any enemy is
+// currently projected on screen and how close the nearest on-screen enemy is.
+// Used to schedule manual VMM Mem/TLB cache refreshes when nobody is in sight
+// or everyone is far away, avoiding mid-fight stutters under -norefresh.
+void ReportRenderState(bool anyOnScreen, float nearestOnScreenDist);
 
 // Single role-label resolver. Role ids are hashed enums, so names come from the
 // reflection pass and the known-id fallbacks live here; the aim filter and the
@@ -242,10 +284,13 @@ struct BvhStatus {
 };
 BvhStatus GetBvhStatus();
 void ReloadBvh();
-const CollisionBVH::Scene& GetBvhScene();
+std::shared_ptr<const CollisionBVH::Scene> GetBvhScene();
 
 bool IsOccluded(const Vector3& origin, const Vector3& target, float tMin = 0.20f, bool checkDynamic = true);
 bool IsCameraOccluded(const Vector3& target, float tMin = 0.20f, bool checkDynamic = true);
 CollisionBVH::DynamicOccluders GetDynamicOccluders();
+
+// High-frequency live fullscreen map pan/zoom camera state (polled on the camera thread).
+bool GetFreshFullMapVariance(Vector2& pos, float& rot, float& cameraSize);
 
 } // namespace RobRunReader

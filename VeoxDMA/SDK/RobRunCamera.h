@@ -16,9 +16,15 @@ struct CameraState {
     float distance = 0.f;
     float verticalFov = 60.f;
     bool fovFromCinemachine = false;
+    bool usedPhysical = false;
 };
 
 void Init(std::uintptr_t gameAssemblyBase);
+
+// Owned by the aim worker, including restoration on shutdown.
+void TickFreecam(bool& enabled, float& speed, std::uint64_t session, const CameraState& eye, std::uintptr_t views, std::uintptr_t game);
+void StopFreecam(const char* reason = nullptr);
+const char* GetFreecamStatus();
 
 // Reads BattleCameraModel and attaches the active Cinemachine vertical FOV.
 CameraState Read(std::uintptr_t battleCameraModel);
@@ -26,6 +32,9 @@ CameraState Read(std::uintptr_t battleCameraModel);
 // Reads CinemachineCore -> brain list -> active CinemachineBrain +0xB0.
 // Returns 0 when the path is unavailable.
 float ReadCinemachineFov();
+
+// Returns cached active CinemachineBrain pointer (resolving if needed).
+std::uintptr_t GetCachedBrain(std::uintptr_t views = 0, std::uintptr_t game = 0);
 
 // Builds a row-vector view-projection matrix matching RobRunReader's
 // WorldToScreen convention. aspect = viewport width / viewport height.
